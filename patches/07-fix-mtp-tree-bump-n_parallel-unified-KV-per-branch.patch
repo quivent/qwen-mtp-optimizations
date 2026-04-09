@@ -1,5 +1,5 @@
 From ca1595f37c45e70f56f906112c6b91d62cad95e0 Mon Sep 17 00:00:00 2001
-From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+From: quivent <quivent@users.noreply.github.com>
 Date: Wed, 8 Apr 2026 19:53:41 -0400
 Subject: [PATCH] fix(mtp-tree): bump n_parallel + unified KV; per-branch
  id_last layout

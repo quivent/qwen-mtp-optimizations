@@ -1,5 +1,5 @@
 From 6f85e88170db11ba0727d60161ff28e2f34a2b22 Mon Sep 17 00:00:00 2001
-From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+From: quivent <quivent@users.noreply.github.com>
 Date: Wed, 8 Apr 2026 21:47:39 -0400
 Subject: [PATCH] feat(mtp): stacked hidden-noise ensemble (MTP_STACK_N)
 MIME-Version: 1.0

@@ -1,5 +1,5 @@
 From a96ffc8060d0713fb9a66365fdf82c129d146709 Mon Sep 17 00:00:00 2001
-From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+From: quivent <quivent@users.noreply.github.com>
 Date: Wed, 8 Apr 2026 19:34:52 -0400
 Subject: [PATCH] feat(mtp): MTP_REFRESH_EVERY periodic T=1 hidden-state
  refresh

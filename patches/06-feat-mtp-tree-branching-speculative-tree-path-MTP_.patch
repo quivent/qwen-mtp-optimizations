@@ -1,5 +1,5 @@
 From d4af5df2cd317278e22cfb79cb5a792c9165a37a Mon Sep 17 00:00:00 2001
-From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+From: quivent <quivent@users.noreply.github.com>
 Date: Wed, 8 Apr 2026 19:41:44 -0400
 Subject: [PATCH] feat(mtp-tree): branching speculative tree path
  (MTP_TREE_B/DEPTH)
