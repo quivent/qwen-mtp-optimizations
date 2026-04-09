@@ -30,6 +30,18 @@ Optimization on top of the ensemble path: on a top-1 hit, trim attn KV + force t
 ### 09 — Stacked hidden-noise validator (NEGATIVE result)
 Run the MTP head N times per draft step with small Gaussian noise added to `prev_hidden`, ensemble-vote the results. Hypothesis: noisy logits would average out into a more reliable argmax. **Result: doesn't work.** The MTP head is structurally saturated — small perturbations don't move the argmax at all (accept count was byte-identical at N=1, 2, 4, 8), and large perturbations only shift it within run-to-run noise. The bottleneck isn't noisy logits; it's that the head's top-1 is structurally wrong ~90% of the time. Per-pass cost makes it strictly worse (5.4 tok/s at N=2 vs 7.8 vanilla). Optimal N=1, i.e. don't enable. **Decisively negative — published as the implementation record.**
 
+## ⚡ The headline result (post-bug-fix re-validation)
+
+Variants 01 (adaptive chain) + the in-graph chained-recurrent threading from [qwen-mtp-llamacpp](https://github.com/quivent/qwen-mtp-llamacpp) patch 09 deliver **1.99× over K=1 vanilla** when combined with the rollback bookkeeping fix from patch 11:
+
+```bash
+MTP_CHAIN_KMAX=2 MTP_CHAIN_THRESH=0.85 ./build/bin/llama-mtp-speculative -m $MODEL ...
+```
+
+5-prompt mean (Qwen3.5-27B Q4_K_M, M4 Max): **K=1 vanilla 7.02 tok/s → chained recipe 13.98 tok/s** (0.78× of plain decode 17.90). Coherent output verified against plain decode on all 5 prompts. This is the same recipe MLX `stacked_v2.py` uses to hit 1.73× on its baseline.
+
+See [qwen-mtp-research/docs/the-recipe.md](https://github.com/quivent/qwen-mtp-research/blob/main/docs/the-recipe.md) for the full breakdown.
+
 ## Honest measurement caveat
 
 These variants were originally developed against an MTP path that contained a one-line cache-bookkeeping bug (fixed in [qwen-mtp-llamacpp](https://github.com/quivent/qwen-mtp-llamacpp) patch 11). With that bug present, every variant's measurements were on degraded text. After the fix, the K=1 vanilla baseline produces correct output at 7.64 tok/s vs plain decode at 17.90 tok/s on Qwen3.5-27B Q4_K_M (M4 Max).
