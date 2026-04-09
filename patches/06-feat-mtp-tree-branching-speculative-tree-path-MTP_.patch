@@ -1,0 +1,244 @@
+From d4af5df2cd317278e22cfb79cb5a792c9165a37a Mon Sep 17 00:00:00 2001
+From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+Date: Wed, 8 Apr 2026 19:41:44 -0400
+Subject: [PATCH] feat(mtp-tree): branching speculative tree path
+ (MTP_TREE_B/DEPTH)
+
+Opt-in tree variant on top of the single-branch MTP path. When both
+MTP_TREE_B>=2 and MTP_TREE_DEPTH>=1 are set, at each draft step we:
+
+  1. Draft root-level logits via llama_mtp_draft and take top-B roots.
+  2. For each root, greedily chain MTP to depth D-1 (reusing the shared
+     main-decode hidden state).
+  3. Fork seqs 1..B-1 from seq 0 up to n_past (seq_cp is alias-only on
+     recurrent state; we snapshot+restore after verify to clean up).
+  4. Build a single multi-seq verify batch of 1 + B*D tokens. Slot 0
+     (id_last) carries all B seq_ids; each branch token carries its
+     own single seq_id.
+  5. After one batched decode, find the longest accepted prefix across
+     branches and pick the winning root.
+  6. Restore recurrent state, purge aux seqs, and re-decode the committed
+     prefix autoregressively so recurrent numerics match the AR path
+     (same strategy as the linear rejection rollback).
+
+Default behavior is unchanged (tree_on=false unless both env vars set).
+Adds tree-iter / hit / acc_token stats printed at end of run.
+---
+ examples/mtp-speculative/mtp-speculative.cpp | 184 +++++++++++++++++++
+ 1 file changed, 184 insertions(+)
+
+diff --git a/examples/mtp-speculative/mtp-speculative.cpp b/examples/mtp-speculative/mtp-speculative.cpp
+index 006792f2e..6c3d2d61a 100644
+--- a/examples/mtp-speculative/mtp-speculative.cpp
++++ b/examples/mtp-speculative/mtp-speculative.cpp
+@@ -14,9 +14,12 @@
+ #include "sampling.h"
+ #include "speculative-mtp.h"
+ 
++#include <algorithm>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ // Helper: pull logits for draft position i from a just-decoded verify batch.
+@@ -220,6 +223,181 @@ int main(int argc, char ** argv) {
+             if ((int) generated.size() >= n_predict) break;
+             continue;
+         }
++
++        // =====================================================================
++        // BRANCHING SPECULATIVE TREE PATH (opt-in via MTP_TREE_B / MTP_TREE_DEPTH)
++        // =====================================================================
++        if (tree_on) {
++            bool tree_did_iter = false;
++            do {
++                // --- Step 1: draft root level via llama_mtp_draft with
++                // out_logits populated, then pick top-B candidates.
++                std::vector<float> root_logits((size_t) n_vocab);
++                llama_token dummy_tok = 0;
++                const int32_t rc_root = llama_mtp_draft(ctx_tgt, id_last, 1, &dummy_tok, root_logits.data());
++                if (rc_root <= 0) break; // no MTP head → fall through
++
++                // top-B by logit.
++                std::vector<llama_token> roots(tree_B, 0);
++                {
++                    std::vector<std::pair<float, int32_t>> scored; scored.reserve(n_vocab);
++                    for (int32_t v = 0; v < n_vocab; ++v) scored.emplace_back(root_logits[v], v);
++                    std::partial_sort(scored.begin(), scored.begin() + tree_B, scored.end(),
++                                      [](const auto & a, const auto & b) { return a.first > b.first; });
++                    for (int32_t b = 0; b < tree_B; ++b) roots[b] = (llama_token) scored[b].second;
++                }
++
++                // --- Step 2: for each root, greedily chain MTP to depth D-1.
++                std::vector<std::vector<llama_token>> branches(tree_B);
++                for (int32_t b = 0; b < tree_B; ++b) {
++                    branches[b].reserve(tree_D);
++                    branches[b].push_back(roots[b]);
++                    if (tree_D >= 2) {
++                        std::vector<llama_token> chain((size_t) (tree_D - 1), 0);
++                        const int32_t rc_c = llama_mtp_draft(ctx_tgt, roots[b], tree_D - 1, chain.data(), nullptr);
++                        for (int32_t k = 0; k < rc_c; ++k) branches[b].push_back(chain[k]);
++                        while ((int32_t) branches[b].size() < tree_D) branches[b].push_back(roots[b]);
++                    }
++                }
++
++                // --- Step 3: fork seqs 1..B-1 from seq 0 at [0, n_past).
++                // seq_cp on recurrent state is alias-only (documented limitation);
++                // we snapshot+restore after verify to clean up.
++                for (int32_t b = 1; b < tree_B; ++b) {
++                    llama_memory_seq_cp(mem_tgt, 0, b, 0, n_past);
++                }
++
++                // --- Step 4: build multi-seq verify batch.
++                //   slot 0: id_last at n_past, seq_ids = {0..B-1}, logits=1
++                //   slot 1+b*D+d: branches[b][d] at n_past+1+d, seq_id = {b}, logits=1
++                verify_batch.n_tokens    = 1 + tree_B * tree_D;
++                verify_batch.token[0]    = id_last;
++                verify_batch.pos[0]      = n_past;
++                verify_batch.n_seq_id[0] = tree_B;
++                for (int32_t b = 0; b < tree_B; ++b) verify_batch.seq_id[0][b] = b;
++                verify_batch.logits[0]   = 1;
++                for (int32_t b = 0; b < tree_B; ++b) {
++                    for (int32_t d = 0; d < tree_D; ++d) {
++                        const int32_t slot = 1 + b * tree_D + d;
++                        verify_batch.token[slot]     = branches[b][d];
++                        verify_batch.pos[slot]       = n_past + 1 + d;
++                        verify_batch.n_seq_id[slot]  = 1;
++                        verify_batch.seq_id[slot][0] = b;
++                        verify_batch.logits[slot]    = 1;
++                    }
++                }
++
++                // Snapshot recurrent state so we can restore after verify.
++                llama_memory_recurrent_snapshot_t tsnap = nullptr;
++                (void) llama_memory_snapshot_recurrent(ctx_tgt, &tsnap);
++
++                if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                    LOG_ERR("%s: tree verify decode failed\n", __func__);
++                    llama_memory_release_snapshot(tsnap);
++                    return 1;
++                }
++                common_speculative_mtp_note_forward_pass(spec);
++                tree_iters++;
++                tree_did_iter = true;
++
++                // --- Step 5: find longest accepted prefix across branches.
++                auto row_argmax = [&](const float * l) -> llama_token {
++                    llama_token best = 0; float bv = l[0];
++                    for (int32_t v = 1; v < n_vocab; ++v) { if (l[v] > bv) { bv = l[v]; best = v; } }
++                    return best;
++                };
++
++                // Slot 0 logits (position n_past) predict the first draft token.
++                // The argmax is the same across all branches because slot 0
++                // is the shared id_last.
++                const float * l_pos0 = llama_get_logits_ith(ctx_tgt, 0);
++                if (l_pos0 == nullptr) {
++                    llama_memory_release_snapshot(tsnap);
++                    return 1;
++                }
++                llama_token argmax_pos0 = row_argmax(l_pos0);
++
++                int32_t best_b = 0, best_acc = 0;
++                for (int32_t b = 0; b < tree_B; ++b) {
++                    int32_t acc = 0;
++                    if (branches[b][0] == argmax_pos0) {
++                        acc = 1;
++                        for (int32_t d = 1; d < tree_D; ++d) {
++                            const int32_t pred_slot = 1 + b * tree_D + (d - 1);
++                            const float * lp = llama_get_logits_ith(ctx_tgt, pred_slot);
++                            if (lp == nullptr) break;
++                            if (row_argmax(lp) == branches[b][d]) acc++; else break;
++                        }
++                    }
++                    if (acc > best_acc) { best_acc = acc; best_b = b; }
++                }
++
++                // Correction token.
++                llama_token corr_tok = argmax_pos0;
++                if (best_acc > 0) {
++                    const int32_t pred_slot = 1 + best_b * tree_D + (best_acc - 1);
++                    const float * lp = llama_get_logits_ith(ctx_tgt, pred_slot);
++                    if (lp != nullptr) corr_tok = row_argmax(lp);
++                    tree_acc_tok += (size_t) best_acc;
++                    tree_hit_iter++;
++                }
++
++                // --- Step 6: restore recurrent, purge aux seqs, re-decode
++                // committed prefix autoregressively so recurrent numerics match
++                // the linear AR path (same strategy as the rejection rollback
++                // in the non-tree path below).
++                if (tsnap != nullptr) {
++                    (void) llama_memory_restore_recurrent(ctx_tgt, tsnap);
++                }
++                for (int32_t b = 1; b < tree_B; ++b) {
++                    llama_memory_seq_rm(mem_tgt, b, -1, -1);
++                }
++                (void) llama_memory_seq_rm_attn_only(ctx_tgt, 0, n_past, -1);
++
++                std::vector<llama_token> commit_toks;
++                commit_toks.reserve(2 + best_acc);
++                commit_toks.push_back(id_last);
++                for (int32_t i = 0; i < best_acc; ++i) commit_toks.push_back(branches[best_b][i]);
++                commit_toks.push_back(corr_tok);
++
++                bool commit_ok = true;
++                for (size_t i = 0; i < commit_toks.size(); ++i) {
++                    verify_batch.n_tokens     = 1;
++                    verify_batch.token[0]     = commit_toks[i];
++                    verify_batch.pos[0]       = n_past + (int32_t) i;
++                    verify_batch.n_seq_id[0]  = 1;
++                    verify_batch.seq_id[0][0] = 0;
++                    verify_batch.logits[0]    = (i == commit_toks.size() - 1) ? 1 : 0;
++                    if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                        LOG_ERR("%s: tree commit re-decode step %zu failed\n", __func__, i);
++                        commit_ok = false;
++                        break;
++                    }
++                    common_speculative_mtp_note_forward_pass(spec);
++                }
++                llama_memory_release_snapshot(tsnap);
++                if (!commit_ok) return 1;
++
++                for (int32_t i = 0; i < best_acc; ++i) {
++                    generated.push_back(branches[best_b][i]);
++                    LOG("%s", common_token_to_piece(ctx_tgt, branches[best_b][i]).c_str());
++                }
++                generated.push_back(corr_tok);
++                LOG("%s", common_token_to_piece(ctx_tgt, corr_tok).c_str());
++                common_speculative_mtp_note_committed(spec, (size_t) (best_acc + 1));
++                common_speculative_mtp_accept(spec, tree_B * tree_D, best_acc);
++
++                n_past += (int32_t) commit_toks.size();
++                id_last = corr_tok;
++                tokens_since_refresh += best_acc + 1;
++            } while (false);
++            if (tree_did_iter) {
++                if (id_last == eos_tok) break;
++                continue;
++            }
++            // else fall through to linear path
++        }
++
+         // MTP_FORCE_AR=1 disables MTP drafting entirely and runs the plain
+         // greedy-AR path through this binary. This is the known byte-identity
+         // baseline vs `llama-simple -n N`: when enabled, the only difference
+@@ -614,6 +792,12 @@ int main(int argc, char ** argv) {
+     if (mtp_refresh_every > 0) {
+         LOG("mtp_refresh: every=%d n_refreshes=%d\n", mtp_refresh_every, n_refreshes);
+     }
++    if (tree_on) {
++        const double acc_per_iter = tree_iters ? (double) tree_acc_tok / (double) tree_iters : 0.0;
++        const double hit_pct      = tree_iters ? 100.0 * (double) tree_hit_iter / (double) tree_iters : 0.0;
++        LOG_INF("mtp_tree: B=%d D=%d iters=%zu hits=%zu (%.1f%%) acc_tokens=%zu avg_acc/iter=%.3f\n",
++                tree_B, tree_D, tree_iters, tree_hit_iter, hit_pct, tree_acc_tok, acc_per_iter);
++    }
+     if (ensemble_on) {
+         const int32_t n_ens_cycles = n_ens_hit_d0 + n_ens_hit_alt + n_ens_miss;
+         const double p_d0  = n_ens_cycles ? 100.0 * n_ens_hit_d0  / n_ens_cycles : 0.0;
+-- 
+2.51.2
+

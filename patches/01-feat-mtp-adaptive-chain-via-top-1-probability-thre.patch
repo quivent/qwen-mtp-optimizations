@@ -1,0 +1,112 @@
+From 7ac89131eedf1ac3b129f21a87579a18fc5c79fb Mon Sep 17 00:00:00 2001
+From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+Date: Wed, 8 Apr 2026 18:42:37 -0400
+Subject: [PATCH] feat(mtp): adaptive chain via top-1 probability threshold
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds an env-var-gated confidence threshold to llama_mtp_draft's K-step
+chain loop. After each MTP draft step, compute the top-1 probability
+from softmax(logits) and stop chaining when it falls below the threshold.
+
+Env vars:
+  MTP_CHAIN_THRESH — top-1 prob cut-off in [0, 1]. Default 1.0 disables
+                     the gate (stop-after-k=1 behavior preserved).
+  MTP_CHAIN_KMAX   — hard cap on chain depth regardless of confidence.
+                     Default = n_draft.
+
+Motivation: on Qwen3.5-27B MLX, the user's "Adaptive MTP chain" variant
+reaches 49.5 tok/s on Huihui-abliterated (1.68x) and 51.1 on vanilla
+(1.73x) — above the static K=1 / 42.7 ceiling (1.45x). The mechanism is
+confidence-gated chaining: let the head chain further when it's sure,
+stop when it isn't. This commit ports the gate; tuning the threshold
+and kmax to reproduce those numbers requires (a) working split-recurrence
+rollback so K>1 chains don't contaminate the recurrent state, and (b)
+a sweep over (thresh, kmax) on real prompts.
+
+No behavior change by default (MTP_CHAIN_THRESH unset → 1.0 → K=1 only).
+Opt-in via env var.
+---
+ src/llama-context.cpp | 45 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 593468f6d..c7773c12b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3764,6 +3764,33 @@ int32_t llama_mtp_draft(
+         return -2;
+     }
+ 
++    // Adaptive chain: stop drafting early when the MTP head's confidence in
++    // its own top-1 prediction falls below a threshold. Signal is top-1
++    // probability computed via softmax(logits).max(). Tuned via env vars so
++    // the benchmark harness can sweep without recompiling.
++    //
++    //   MTP_CHAIN_THRESH — top-1 prob threshold in [0, 1]. Chain continues
++    //                       while top1_prob >= thresh. Default 1.0 disables
++    //                       adaptive chaining entirely (always stop after
++    //                       k=1 regardless of n_draft) — set to a lower
++    //                       value like 0.85 to enable.
++    //   MTP_CHAIN_KMAX   — hard cap on chain depth regardless of confidence.
++    //                       Default = n_draft (no extra cap).
++    //
++    // When thresh == 1.0 and kmax == n_draft we recover the original
++    // greedy-argmax-always-chain behavior.
++    float   chain_thresh = 1.0f;
++    int32_t chain_kmax   = n_draft;
++    if (const char * s = std::getenv("MTP_CHAIN_THRESH")) {
++        chain_thresh = (float) std::atof(s);
++    }
++    if (const char * s = std::getenv("MTP_CHAIN_KMAX")) {
++        const int32_t v = (int32_t) std::atoi(s);
++        if (v > 0 && v < chain_kmax) {
++            chain_kmax = v;
++        }
++    }
++
+     // Scratch buffer for one row of logits per draft step.
+     std::vector<float> scratch_logits((size_t) n_vocab);
+ 
+@@ -3780,7 +3807,7 @@ int32_t llama_mtp_draft(
+     const float * next_prev_hidden = nullptr;
+     int32_t produced = 0;
+ 
+-    for (int32_t k = 0; k < n_draft; ++k) {
++    for (int32_t k = 0; k < chain_kmax; ++k) {
+         const int32_t rc = ctx->mtp_graph_compute(
+                 seed,
+                 next_prev_hidden,
+@@ -3809,13 +3836,27 @@ int32_t llama_mtp_draft(
+                         scratch_logits.data(),
+                         (size_t) n_vocab * sizeof(float));
+         }
++        ++produced;
++
++        // Confidence gate: compute softmax(logits).max() as top-1 probability
++        // and stop the chain early if below threshold. We use the numerically
++        // stable trick: top1_prob = 1 / sum(exp(logits - best_val)).
++        if (chain_thresh < 1.0f && produced < chain_kmax) {
++            double denom = 0.0;
++            for (int64_t v = 0; v < n_vocab; ++v) {
++                denom += std::exp((double) (scratch_logits[v] - best_val));
++            }
++            const float top1_prob = (float) (1.0 / denom);
++            if (top1_prob < chain_thresh) {
++                break;
++            }
++        }
+ 
+         // Chain: next step's seed is this step's argmax, and its prev_hidden
+         // is this step's MTP layer output hidden (not the stale main-decode
+         // hidden). This is the correctness fix for drafts at positions 2..K.
+         seed = (llama_token) best_idx;
+         next_prev_hidden = scratch_out_hidden.data();
+-        ++produced;
+     }
+ 
+     return produced;
+-- 
+2.51.2
+

@@ -1,0 +1,115 @@
+From a96ffc8060d0713fb9a66365fdf82c129d146709 Mon Sep 17 00:00:00 2001
+From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+Date: Wed, 8 Apr 2026 19:34:52 -0400
+Subject: [PATCH] feat(mtp): MTP_REFRESH_EVERY periodic T=1 hidden-state
+ refresh
+
+Strategy A drift correction: every N committed tokens, skip the MTP
+draft path and do a plain T=1 decode of id_last. That single-token
+decode traverses build_delta_net_autoregressive cleanly and bounds
+the mtp_prev_hidden drift that otherwise compounds across verify
+iterations. Opt-in via env MTP_REFRESH_EVERY=N, default 0 disabled.
+---
+ examples/mtp-speculative/mtp-speculative.cpp | 48 ++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/examples/mtp-speculative/mtp-speculative.cpp b/examples/mtp-speculative/mtp-speculative.cpp
+index 2870c3c73..4f4b072ff 100644
+--- a/examples/mtp-speculative/mtp-speculative.cpp
++++ b/examples/mtp-speculative/mtp-speculative.cpp
+@@ -136,9 +136,50 @@ int main(int argc, char ** argv) {
+ 
+     const llama_token eos_tok = llama_vocab_eos(vocab_tgt);
+ 
++    // Hidden-state drift correction (strategy A: periodic T=1 refresh).
++    // Env var MTP_REFRESH_EVERY=N (default 0 = disabled). When >0, every N
++    // committed tokens we skip the MTP draft path and do a plain T=1 decode
++    // of id_last. That single-token decode traverses build_delta_net_autoregressive
++    // and leaves ctx->mtp_prev_hidden in a clean state, bounding the drift
++    // that otherwise compounds across speculative verify iterations.
++    const char * env_refresh = getenv("MTP_REFRESH_EVERY");
++    const int32_t mtp_refresh_every = (env_refresh != nullptr) ? atoi(env_refresh) : 0;
++    int32_t tokens_since_refresh = 0;
++    int32_t n_refreshes = 0;
++
+     const int64_t t_dec_start = ggml_time_us();
+ 
+     while ((int) generated.size() < n_predict) {
++        // Periodic T=1 refresh: force a clean hidden-state pass on id_last
++        // before continuing speculation. This resets drift to zero.
++        if (mtp_refresh_every > 0 && tokens_since_refresh >= mtp_refresh_every) {
++            verify_batch.n_tokens     = 1;
++            verify_batch.token[0]     = id_last;
++            verify_batch.pos[0]       = n_past;
++            verify_batch.n_seq_id[0]  = 1;
++            verify_batch.seq_id[0][0] = 0;
++            verify_batch.logits[0]    = 1;
++
++            if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                LOG_ERR("%s: T=1 refresh decode failed\n", __func__);
++                break;
++            }
++            common_speculative_mtp_note_forward_pass(spec);
++            n_past += 1;
++
++            const llama_token nt = argmax_logits(llama_get_logits_ith(ctx_tgt, 0));
++            generated.push_back(nt);
++            common_speculative_mtp_note_committed(spec, 1);
++            LOG("%s", common_token_to_piece(ctx_tgt, nt).c_str());
++
++            id_last = nt;
++            tokens_since_refresh = 0;
++            n_refreshes++;
++
++            if (nt == eos_tok) break;
++            if ((int) generated.size() >= n_predict) break;
++            continue;
++        }
+         // MTP_FORCE_AR=1 disables MTP drafting entirely and runs the plain
+         // greedy-AR path through this binary. This is the known byte-identity
+         // baseline vs `llama-simple -n N`: when enabled, the only difference
+@@ -186,6 +227,7 @@ int main(int argc, char ** argv) {
+             LOG("%s", common_token_to_piece(ctx_tgt, nt).c_str());
+ 
+             id_last = nt;
++            tokens_since_refresh += 1;
+             if (nt == eos_tok) break;
+             continue;
+         }
+@@ -344,6 +386,7 @@ int main(int argc, char ** argv) {
+                 common_speculative_mtp_note_forward_pass(spec);
+                 n_past  = n_past + 1 + n_drafted + 1;
+                 id_last = corr;
++                tokens_since_refresh += (n_accepted + 1);
+             } else {
+                 bool rollback_ok = true;
+                 for (int32_t i = 0; i < n_commit; ++i) {
+@@ -368,6 +411,7 @@ int main(int argc, char ** argv) {
+                 }
+                 n_past  += n_commit;
+                 id_last = corr;
++                tokens_since_refresh += (n_accepted + 1);
+             }
+         } else {
+             // All drafts accepted: the logits at the final slot give the
+@@ -382,6 +426,7 @@ int main(int argc, char ** argv) {
+ 
+             n_past += 1 + n_drafted; // id_last + accepted drafts committed to cache
+             id_last = nt;
++            tokens_since_refresh += (n_drafted + 1);
+         }
+ 
+         // Release the verify-pass snapshot. On accept it represents stale
+@@ -400,6 +445,9 @@ int main(int argc, char ** argv) {
+ 
+     LOG("\n\n");
+     common_speculative_mtp_print_stats(spec, elapsed_s);
++    if (mtp_refresh_every > 0) {
++        LOG("mtp_refresh: every=%d n_refreshes=%d\n", mtp_refresh_every, n_refreshes);
++    }
+ 
+     llama_batch_free(verify_batch);
+     common_speculative_mtp_free(spec);
+-- 
+2.51.2
+

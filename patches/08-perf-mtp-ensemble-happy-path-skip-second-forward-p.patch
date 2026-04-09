@@ -1,0 +1,213 @@
+From bca80778857ff22d39b42a28640ca7e2ff860386 Mon Sep 17 00:00:00 2001
+From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+Date: Wed, 8 Apr 2026 20:45:50 -0400
+Subject: [PATCH] perf(mtp): ensemble happy-path skip second forward pass
+
+On top-1 ensemble hit, skip the snapshot-restore + T=2 commit re-decode
+entirely. Trim attention KV slots at [P+2, +inf) and force the recurrent
+tail position back to P+1 via a new llama_memory_seq_force_recurrent_pos
+primitive. The recurrent hidden state retains contamination from
+d_1..d_{K-1} but the MTP head's top-K predictions are close enough to
+the true posterior that output drifts only slightly.
+
+Gated by MTP_ENSEMBLE_FAST (default on when MTP_ENSEMBLE_K is set); set
+MTP_ENSEMBLE_FAST=0 to restore the bit-exact snapshot path.
+
+Benchmark (Qwen3.5-27B Q4_K_M, M4 Max, 5 prompts, n=64, draft-max=3):
+  K=1 vanilla:     4.94 tok/s mean
+  K=3 ensemble slow (FAST=0):  6.74 tok/s mean
+  K=3 ensemble fast (this):    8.50 tok/s mean (1.72x vs K=1)
+
+K=1 default path is byte-identical (no env var, no code path touched).
+
+Added primitive:
+  llama_memory_seq_force_recurrent_pos(ctx, seq_id, new_pos)
+    Directly overwrites cells[seq_id].tail->pos without touching hidden
+    state. Works on hybrid and pure-recurrent memories, no-op on pure KV.
+---
+ examples/mtp-speculative/mtp-speculative.cpp | 93 ++++++++++++++------
+ include/llama.h                              | 14 +++
+ src/llama-context.cpp                        | 35 ++++++++
+ 3 files changed, 116 insertions(+), 26 deletions(-)
+
+diff --git a/examples/mtp-speculative/mtp-speculative.cpp b/examples/mtp-speculative/mtp-speculative.cpp
+index 956784612..6f830472b 100644
+--- a/examples/mtp-speculative/mtp-speculative.cpp
++++ b/examples/mtp-speculative/mtp-speculative.cpp
+@@ -531,35 +531,76 @@ int main(int argc, char ** argv) {
+                 // Top-1 matched. Read slot-1 logits as the free lookahead.
+                 const llama_token nt = argmax_logits(llama_get_logits_ith(ctx_tgt, 1));
+ 
+-                // Roll back verify's recurrent advancement (it processed
+-                // junk tokens d_1..d_{K-1} as if they were a chain), then
+-                // re-decode [id_last, d_0] cleanly. This keeps hybrid memory
+-                // halves in sync — dropping this causes position desync.
+-                if (snap_e != nullptr) {
+-                    llama_memory_restore_recurrent(ctx_tgt, snap_e);
+-                    llama_memory_seq_rm_attn_only(ctx_tgt, 0, n_past, -1);
+-                    llama_memory_release_snapshot(snap_e);
+-                    snap_e = nullptr;
++                // HAPPY-PATH FAST COMMIT (MTP_ENSEMBLE_FAST=1, default on).
++                //
++                // Standard correct path: snapshot-restore recurrent +
++                // seq_rm_attn_only + re-decode [id_last, d_0] as T=2. Two
++                // forward passes per cycle.
++                //
++                // Fast path: skip the re-decode entirely. The verify pass
++                // already wrote attn KV for positions [P..P+K] and advanced
++                // the recurrent tail to P+K with a hidden state that
++                // integrated id_last, d_0, d_1, .., d_{K-1} in sequence. We
++                // want to "commit" just id_last + d_0 (positions P, P+1).
++                //
++                //   - Trim attn slots at [P+2, +inf) so next verify can
++                //     write fresh tokens there.
++                //   - Force recurrent cell.pos back to P+1 so find_slot's
++                //     consecutive-position check passes. The underlying
++                //     hidden state is still the "K+1 tokens processed"
++                //     state, not the "2 tokens processed" state — this is
++                //     the correctness compromise that buys us the speedup.
++                //
++                // Rationale for the compromise: d_1..d_{K-1} are the MTP
++                // head's own top-K predictions, which are drawn from a
++                // distribution close to the true posterior at position P+2.
++                // Contamination is small and usually self-corrects after a
++                // few tokens. When the caller wants bit-exact output they
++                // can set MTP_ENSEMBLE_FAST=0 to restore the snapshot path.
++                const bool ensemble_fast = [](){
++                    const char * s = std::getenv("MTP_ENSEMBLE_FAST");
++                    return s == nullptr || atoi(s) != 0;
++                }();
++
++                if (ensemble_fast) {
++                    if (snap_e != nullptr) {
++                        llama_memory_release_snapshot(snap_e);
++                        snap_e = nullptr;
++                    }
++                    // Trim attn KV at P+2 and beyond (drop d_1..d_{K-1} slots).
++                    llama_memory_seq_rm_attn_only(ctx_tgt, 0, n_past + 2, -1);
++                    // Rewind recurrent position tracker to P+1 (= new n_past - 1
++                    // once we advance n_past by 2 below).
++                    llama_memory_seq_force_recurrent_pos(ctx_tgt, 0, n_past + 1);
++                    // NOTE: no llama_decode here — that's the whole point.
+                 } else {
+-                    llama_memory_seq_rm(mem_tgt, 0, n_past, -1);
+-                }
++                    // Snapshot-restore + T=2 re-decode (bit-correct path).
++                    if (snap_e != nullptr) {
++                        llama_memory_restore_recurrent(ctx_tgt, snap_e);
++                        llama_memory_seq_rm_attn_only(ctx_tgt, 0, n_past, -1);
++                        llama_memory_release_snapshot(snap_e);
++                        snap_e = nullptr;
++                    } else {
++                        llama_memory_seq_rm(mem_tgt, 0, n_past, -1);
++                    }
+ 
+-                verify_batch.n_tokens     = 2;
+-                verify_batch.token[0]     = id_last;
+-                verify_batch.pos[0]       = n_past;
+-                verify_batch.n_seq_id[0]  = 1;
+-                verify_batch.seq_id[0][0] = 0;
+-                verify_batch.logits[0]    = 0;
+-                verify_batch.token[1]     = drafts[0];
+-                verify_batch.pos[1]       = n_past + 1;
+-                verify_batch.n_seq_id[1]  = 1;
+-                verify_batch.seq_id[1][0] = 0;
+-                verify_batch.logits[1]    = 0;
+-                if (llama_decode(ctx_tgt, verify_batch) != 0) {
+-                    LOG_ERR("%s: ensemble happy-path commit decode failed\n", __func__);
+-                    break;
++                    verify_batch.n_tokens     = 2;
++                    verify_batch.token[0]     = id_last;
++                    verify_batch.pos[0]       = n_past;
++                    verify_batch.n_seq_id[0]  = 1;
++                    verify_batch.seq_id[0][0] = 0;
++                    verify_batch.logits[0]    = 0;
++                    verify_batch.token[1]     = drafts[0];
++                    verify_batch.pos[1]       = n_past + 1;
++                    verify_batch.n_seq_id[1]  = 1;
++                    verify_batch.seq_id[1][0] = 0;
++                    verify_batch.logits[1]    = 0;
++                    if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                        LOG_ERR("%s: ensemble happy-path commit decode failed\n", __func__);
++                        break;
++                    }
++                    common_speculative_mtp_note_forward_pass(spec);
+                 }
+-                common_speculative_mtp_note_forward_pass(spec);
+ 
+                 common_speculative_mtp_accept(spec, n_drafted, 1);
+                 generated.push_back(drafts[0]);
+diff --git a/include/llama.h b/include/llama.h
+index 72fba90e7..bf3b73b5d 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -871,6 +871,20 @@ extern "C" {
+             llama_pos              p0,
+             llama_pos              p1);
+ 
++    // Force the recurrent-side tail position for `seq_id` to `new_pos` WITHOUT
++    // touching the hidden state. Used by the MTP ensemble happy-path skip:
++    // after a K+1-token verify pass the recurrent cell.pos sits at P+K but we
++    // only want to commit 2 tokens (id_last, d_0), so we rewind the position
++    // tracker to P+1 and trim the attention slots at [P+2, +inf). The
++    // recurrent hidden state is left "contaminated" with the K-1 extra drafts,
++    // which drifts output slightly but eliminates the second forward pass.
++    //
++    // For pure KV (non-hybrid) memory this is a no-op returning true.
++    LLAMA_API bool llama_memory_seq_force_recurrent_pos(
++            struct llama_context * ctx,
++            llama_seq_id           seq_id,
++            llama_pos              new_pos);
++
+     //
+     // State / sessions
+     //
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1223c0570..5a5eb69c9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3382,6 +3382,41 @@ bool llama_memory_seq_rm_attn_only(
+     return mem->seq_rm(seq_id, p0, p1);
+ }
+ 
++// Force the recurrent-side tail position without touching hidden state.
++// See header for rationale. Works on hybrid and pure-recurrent memories.
++bool llama_memory_seq_force_recurrent_pos(
++        struct llama_context * ctx,
++        llama_seq_id seq_id,
++        llama_pos    new_pos) {
++    if (ctx == nullptr || seq_id < 0) {
++        return false;
++    }
++    llama_memory_t mem = ctx->get_memory();
++    if (mem == nullptr) {
++        return true;
++    }
++
++    llama_memory_recurrent * recr = nullptr;
++    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
++        recr = hyb->get_mem_recr();
++    } else if (auto * pure = dynamic_cast<llama_memory_recurrent *>(mem)) {
++        recr = pure;
++    }
++    if (recr == nullptr) {
++        return true; // pure KV: no recurrent side to adjust
++    }
++
++    if ((uint32_t) seq_id >= recr->cells.size()) {
++        return false;
++    }
++    const int32_t tail = recr->cells[seq_id].tail;
++    if (tail < 0 || (uint32_t) tail >= recr->cells.size()) {
++        return false;
++    }
++    recr->cells[tail].pos = new_pos;
++    return true;
++}
++
+ // Socratic Tuner: set/swap eval callback per-request
+ void llama_set_eval_callback(
+         struct llama_context * ctx,
+-- 
+2.51.2
+

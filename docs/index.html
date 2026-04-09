@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>qwen-mtp-optimizations · Six speculative decoding variants for Qwen3.5 MTP</title>
+<style>
+:root {
+  --bg: #0a0e1a;
+  --bg-2: #11172a;
+  --fg: #e8ecf5;
+  --muted: #8a94b0;
+  --accent: #7c5cff;
+  --accent-2: #00d4ff;
+  --good: #4ade80;
+  --warn: #fbbf24;
+  --bad: #f87171;
+  --card: #161c30;
+  --border: #232a44;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.bg-grid {
+  position: fixed; inset: 0; z-index: 0;
+  background-image:
+    linear-gradient(rgba(124, 92, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(124, 92, 255, 0.04) 1px, transparent 1px);
+  background-size: 64px 64px;
+  pointer-events: none;
+}
+.bg-glow {
+  position: fixed; inset: 0; z-index: 0;
+  background: radial-gradient(ellipse at 20% 0%, rgba(124, 92, 255, 0.18), transparent 50%),
+              radial-gradient(ellipse at 80% 50%, rgba(0, 212, 255, 0.12), transparent 50%);
+  pointer-events: none;
+}
+main { position: relative; z-index: 1; max-width: 1100px; margin: 0 auto; padding: 80px 32px; }
+.hero { margin-bottom: 80px; }
+.kicker {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+  background: rgba(0, 212, 255, 0.08);
+  border: 1px solid rgba(0, 212, 255, 0.2);
+  padding: 6px 14px;
+  border-radius: 999px;
+  margin-bottom: 24px;
+}
+h1 {
+  font-size: clamp(2.5rem, 6vw, 4.5rem);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  margin-bottom: 24px;
+  background: linear-gradient(135deg, #fff 0%, #b8c0d8 50%, #7c5cff 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.tagline {
+  font-size: 1.35rem;
+  color: var(--muted);
+  max-width: 720px;
+  margin-bottom: 40px;
+}
+.cta-row { display: flex; gap: 16px; flex-wrap: wrap; }
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 28px;
+  border-radius: 12px;
+  font-weight: 600;
+  font-size: 0.95rem;
+  text-decoration: none;
+  transition: all 0.2s ease;
+  border: 1px solid transparent;
+}
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent), #5a3dff);
+  color: white;
+  box-shadow: 0 8px 24px rgba(124, 92, 255, 0.3);
+}
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 12px 32px rgba(124, 92, 255, 0.4); }
+.btn-ghost {
+  background: var(--card);
+  color: var(--fg);
+  border-color: var(--border);
+}
+.btn-ghost:hover { border-color: var(--accent); }
+section { margin-bottom: 80px; }
+h2 {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 24px;
+  color: #fff;
+}
+h2::before {
+  content: "";
+  display: inline-block;
+  width: 4px;
+  height: 24px;
+  background: var(--accent);
+  border-radius: 2px;
+  margin-right: 14px;
+  vertical-align: -3px;
+}
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }
+.metric {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 28px;
+  position: relative;
+  overflow: hidden;
+}
+.metric::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(124, 92, 255, 0.08), transparent 50%);
+  pointer-events: none;
+}
+.metric-label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 12px; }
+.metric-value { font-size: 2.25rem; font-weight: 800; color: #fff; line-height: 1; margin-bottom: 8px; }
+.metric-unit { font-size: 1rem; color: var(--muted); font-weight: 500; margin-left: 6px; }
+.metric-note { font-size: 0.85rem; color: var(--muted); }
+.good .metric-value { color: var(--good); }
+.warn .metric-value { color: var(--warn); }
+.patches { display: grid; gap: 12px; }
+.patch {
+  display: grid;
+  grid-template-columns: 48px 1fr auto;
+  gap: 18px;
+  align-items: center;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 22px;
+  transition: border-color 0.2s;
+}
+.patch:hover { border-color: var(--accent); }
+.patch-num {
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--accent-2);
+}
+.patch-title { font-weight: 600; color: #fff; margin-bottom: 4px; }
+.patch-desc { font-size: 0.9rem; color: var(--muted); }
+.patch-tag {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(124, 92, 255, 0.15);
+  color: var(--accent);
+  white-space: nowrap;
+}
+.patch-tag.fix { background: rgba(74, 222, 128, 0.12); color: var(--good); }
+.patch-tag.diag { background: rgba(251, 191, 36, 0.12); color: var(--warn); }
+.callout {
+  background: linear-gradient(135deg, rgba(74, 222, 128, 0.08), rgba(74, 222, 128, 0.02));
+  border: 1px solid rgba(74, 222, 128, 0.25);
+  border-left: 4px solid var(--good);
+  border-radius: 12px;
+  padding: 24px 28px;
+  margin-bottom: 24px;
+}
+.callout h3 { color: var(--good); margin-bottom: 8px; font-size: 1.1rem; }
+.callout p { color: #cbd5e1; }
+pre {
+  background: #0a0e1a;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  overflow-x: auto;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: #cbd5e1;
+  margin-bottom: 16px;
+}
+.repo-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+.repo-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px;
+  text-decoration: none;
+  color: var(--fg);
+  transition: all 0.2s;
+  display: block;
+}
+.repo-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.repo-card h3 {
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--accent-2);
+  margin-bottom: 8px;
+}
+.repo-card p { font-size: 0.85rem; color: var(--muted); }
+footer {
+  border-top: 1px solid var(--border);
+  padding: 32px 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin-top: 80px;
+}
+.dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-2);
+  margin-right: 8px;
+  vertical-align: 2px;
+  box-shadow: 0 0 12px var(--accent-2);
+}
+</style>
+</head>
+<body>
+<div class="bg-grid"></div>
+<div class="bg-glow"></div>
+<main>
+
+<section class="hero">
+  <span class="kicker"><span class="dot"></span>Exploration</span>
+  <h1>qwen-mtp-optimizations</h1>
+  <p class="tagline">
+    Six speculative-decoding optimization variants for <strong>Qwen3.5-27B</strong> Multi-Token
+    Prediction. Adaptive chain, predictive hidden, perturbed ensemble, branching tree, drift refresh,
+    and ensemble fast-path — each one its own apply-or-skip patch on top of the infrastructure repo.
+  </p>
+  <div class="cta-row">
+    <a class="btn btn-primary" href="https://github.com/quivent/qwen-mtp-llamacpp">View on GitHub →</a>
+    <a class="btn btn-ghost" href="https://github.com/quivent/qwen-mtp-research">Read the research</a>
+  </div>
+</section>
+
+<section>
+  <h2>Honest numbers</h2>
+  <div class="metrics">
+    <div class="metric good">
+      <div class="metric-label">Plain decode baseline</div>
+      <div class="metric-value">17.90<span class="metric-unit">tok/s</span></div>
+      <div class="metric-note">Qwen3.5-27B Q4_K_M, M4 Max</div>
+    </div>
+    <div class="metric warn">
+      <div class="metric-label">K=1 MTP spec (this branch)</div>
+      <div class="metric-value">7.64<span class="metric-unit">tok/s</span></div>
+      <div class="metric-note">0.43× of plain decode · output validates ✓</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Patches in this series</div>
+      <div class="metric-value">11<span class="metric-unit">+ 5 base</span></div>
+      <div class="metric-note">Each one independently apply-able</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>The patch series</h2>
+  <div class="patches">
+    <div class="patch"><div class="patch-num">01</div><div><div class="patch-title">qwen3next MTP graph dispatch</div><div class="patch-desc">Wires <code>LLM_GRAPH_TYPE_MTP</code> for the qwen3next architecture</div></div><div class="patch-tag">feat</div></div>
+    <div class="patch"><div class="patch-num">02</div><div><div class="patch-title">qwen35 MTP draft graph</div><div class="patch-desc">Mirrors the qwen3next path for the dense Qwen3.5 family</div></div><div class="patch-tag">feat</div></div>
+    <div class="patch"><div class="patch-num">03</div><div><div class="patch-title">end-to-end load + execute for qwen35</div><div class="patch-desc">Five separate fixes: converter, classifier, loader, hparam, RoPE</div></div><div class="patch-tag fix">fix</div></div>
+    <div class="patch"><div class="patch-num">04</div><div><div class="patch-title">named mask tensors</div><div class="patch-desc">Surface ggml scheduler state bug in stack traces</div></div><div class="patch-tag diag">diag</div></div>
+    <div class="patch"><div class="patch-num">05</div><div><div class="patch-title">chain prev_hidden across K draft steps</div><div class="patch-desc">Threads hidden state from each MTP step into the next</div></div><div class="patch-tag fix">fix</div></div>
+    <div class="patch"><div class="patch-num">06</div><div><div class="patch-title">private sched_mtp scheduler</div><div class="patch-desc">Isolates MTP graph compute — fixes a cross-decode state leak</div></div><div class="patch-tag fix">fix</div></div>
+    <div class="patch"><div class="patch-num">07</div><div><div class="patch-title">host-side rollback v1</div><div class="patch-desc">Snapshot/restore for recurrent half + seq_rm_attn_only for the attn half</div></div><div class="patch-tag">feat</div></div>
+    <div class="patch"><div class="patch-num">08</div><div><div class="patch-title">AR re-decode + MTP_FORCE_AR</div><div class="patch-desc">Plain-decode-equivalent path for diagnostic baselines</div></div><div class="patch-tag">feat</div></div>
+    <div class="patch"><div class="patch-num">09</div><div><div class="patch-title">in-graph AR loop for T≤16 verify</div><div class="patch-desc">Replaces chunking DeltaNet kernel with sequential AR loop in one graph dispatch</div></div><div class="patch-tag">feat</div></div>
+    <div class="patch"><div class="patch-num">10</div><div><div class="patch-title">batched rollback re-decode</div><div class="patch-desc">Single T=N llama_decode instead of N sequential T=1 calls</div></div><div class="patch-tag">perf</div></div>
+    <div class="patch"><div class="patch-num">11</div><div><div class="patch-title">rollback bookkeeping fix</div><div class="patch-desc">The one-line fix that makes the entire spec path produce correct output</div></div><div class="patch-tag fix">fix</div></div>
+  </div>
+</section>
+
+<section>
+  <h2>The fix that unblocked everything</h2>
+  <div class="callout">
+    <h3>Patch 11 — rollback bookkeeping</h3>
+    <p>After a batched rollback re-decode of <code>[id_last, drafts..., corr]</code>, the old code set <code>id_last = corr</code>. But <code>corr</code> was already written to the cache as the <em>last</em> slot of the batch. The next iteration's verify wrote it a <em>second</em> time, shifting every subsequent position by one. The model saw garbage context and produced "1. 2. 3. ... 1000000" digit-loops.</p>
+  </div>
+<pre><code>// before (broken):
+n_past  += n_commit;
+id_last = corr;
+
+// after (fix):
+const float * tail_logits = llama_get_logits_ith(ctx_tgt, n_commit - 1);
+id_last = argmax_logits(tail_logits);   // mirror accept-all branch
+n_past  += n_commit;</code></pre>
+</section>
+
+<section>
+  <h2>Apply the patches</h2>
+<pre><code>git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+# Apply at upstream commit 9c7911f4f
+git am path/to/qwen-mtp-llamacpp/patches/*.patch
+cmake -B build && cmake --build build -j 12 --target llama-mtp-speculative
+
+MODEL=path/to/qwen3.5-27b-q4km.gguf
+./build/bin/llama-mtp-speculative -m $MODEL -p "Explain photosynthesis." -n 64 -ngl 99</code></pre>
+</section>
+
+<section>
+  <h2>The full set of repos</h2>
+  <div class="repo-grid">
+    <a class="repo-card" href="https://github.com/quivent/qwen-mtp-llamacpp"><h3>qwen-mtp-llamacpp</h3><p>You are here. Infrastructure patches.</p></a>
+    <a class="repo-card" href="https://github.com/quivent/qwen-mtp-tensors"><h3>qwen-mtp-tensors</h3><p>Converter & tensor naming deep dive.</p></a>
+    <a class="repo-card" href="https://github.com/quivent/qwen-mtp-optimizations"><h3>qwen-mtp-optimizations</h3><p>Six speculative decoding variants explored.</p></a>
+    <a class="repo-card" href="https://github.com/quivent/qwen-mtp-research"><h3>qwen-mtp-research</h3><p>Notes, methodology, per-position-heads design.</p></a>
+  </div>
+</section>
+
+<footer>
+  Built during one focused exploration session · MIT licensed · <a href="https://github.com/quivent" style="color:var(--accent-2);">github.com/quivent</a>
+</footer>
+
+</main>
+</body>
+</html>

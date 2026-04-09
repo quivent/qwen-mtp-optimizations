@@ -1,0 +1,151 @@
+From 475aa869b1561ff03acc536a18d7d87c1645735d Mon Sep 17 00:00:00 2001
+From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+Date: Wed, 8 Apr 2026 19:35:05 -0400
+Subject: [PATCH] feat(mtp): predictive hidden draft via embedding delta
+
+Adds MTP_PREDICTIVE_ALPHA env-var gated Option A predictor:
+  h_{t+k} ~= h_main + alpha * sum_{j<k} embed(draft_token_j)
+
+For k>=1, replaces the broken MTP-output-hidden chaining path with
+a predicted main-model hidden computed from the cached h_main plus
+an accumulated scaled embedding of the drafted tokens. Default
+behavior (env var unset) unchanged.
+
+src/llama-context.cpp:llama_mtp_draft
+---
+ src/llama-context.cpp | 100 +++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 94 insertions(+), 6 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 83d228620..41cf9ccce 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3855,6 +3855,20 @@ int32_t llama_mtp_draft(
+         }
+     }
+ 
++    // Predictive hidden state (Option A): for k>=1, approximate what the main
++    // model's hidden would be at position t+k as
++    //   h_{t+k} ~= h_main + alpha * sum_{j<k} embed(draft_token_j)
++    // where h_main is the cached main-decode hidden and embed() is looked up
++    // from model.tok_embd. When MTP_PREDICTIVE_ALPHA is unset we preserve the
++    // previous behavior of feeding the MTP head's own output hidden into the
++    // next step (which is the known-broken chaining path).
++    float   predictive_alpha     = 0.0f;
++    bool    predictive_enabled   = false;
++    if (const char * s = std::getenv("MTP_PREDICTIVE_ALPHA")) {
++        predictive_alpha   = (float) std::atof(s);
++        predictive_enabled = true;
++    }
++
+     // Scratch buffer for one row of logits per draft step.
+     std::vector<float> scratch_logits((size_t) n_vocab);
+ 
+@@ -3862,12 +3876,60 @@ int32_t llama_mtp_draft(
+     // next chained step's prev_hidden. Sized to match the model's n_embd via
+     // the cached mtp_prev_hidden vector (which was populated by the main
+     // decode with exactly that many floats).
+-    std::vector<float> scratch_out_hidden(ctx->get_mtp_prev_hidden_size());
++    const size_t n_embd_mtp = ctx->get_mtp_prev_hidden_size();
++    std::vector<float> scratch_out_hidden(n_embd_mtp);
++
++    // Predictive-mode buffers: accumulator holds the running predicted hidden
++    // (seeded from h_main at k=0, then h_main + alpha * sum embed(prev_tokens)).
++    // emb_row is a scratch row for dequantizing a single tok_embd row.
++    std::vector<float> predict_hidden;
++    std::vector<float> emb_row;
++    if (predictive_enabled) {
++        predict_hidden.resize(n_embd_mtp);
++        emb_row.resize(n_embd_mtp);
++        const float * h_main = ctx->get_mtp_prev_hidden();
++        if (h_main != nullptr) {
++            std::memcpy(predict_hidden.data(), h_main, n_embd_mtp * sizeof(float));
++        } else {
++            // No cached main hidden — disable predictive mode gracefully.
++            predictive_enabled = false;
++        }
++    }
++
++    // Helper: fetch row `tok` from model.tok_embd into `out` (size n_embd_mtp),
++    // dequantizing if necessary. Returns true on success.
++    auto fetch_embed_row = [&](llama_token tok, float * out) -> bool {
++        const ggml_tensor * te = model.tok_embd;
++        if (te == nullptr) return false;
++        if (tok < 0 || (int64_t) tok >= te->ne[1]) return false;
++        const size_t row_bytes = ggml_row_size(te->type, te->ne[0]);
++        const size_t offset    = (size_t) tok * row_bytes;
++        if (te->type == GGML_TYPE_F32) {
++            ggml_backend_tensor_get(te, out, offset, row_bytes);
++            return true;
++        }
++        // Dequantize via type traits.
++        std::vector<uint8_t> raw(row_bytes);
++        ggml_backend_tensor_get(te, raw.data(), offset, row_bytes);
++        const ggml_type_traits * tt = ggml_get_type_traits(te->type);
++        if (te->type == GGML_TYPE_F16) {
++            ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), out, te->ne[0]);
++            return true;
++        }
++        if (te->type == GGML_TYPE_BF16) {
++            ggml_bf16_to_fp32_row((const ggml_bf16_t *) raw.data(), out, te->ne[0]);
++            return true;
++        }
++        if (tt == nullptr || tt->to_float == nullptr) return false;
++        tt->to_float(raw.data(), out, te->ne[0]);
++        return true;
++    };
+ 
+     llama_token seed = last_token;
+     // First step uses the cached main-decode hidden (prev_hidden_override = nullptr
+     // → mtp_graph_compute falls back to ctx->mtp_prev_hidden). Subsequent steps
+-    // use the previous step's MTP output hidden.
++    // use either the predicted hidden (predictive mode) or the previous step's
++    // MTP output hidden (legacy chained mode).
+     const float * next_prev_hidden = nullptr;
+     int32_t produced = 0;
+ 
+@@ -3916,11 +3978,37 @@ int32_t llama_mtp_draft(
+             }
+         }
+ 
+-        // Chain: next step's seed is this step's argmax, and its prev_hidden
+-        // is this step's MTP layer output hidden (not the stale main-decode
+-        // hidden). This is the correctness fix for drafts at positions 2..K.
++        // Chain: next step's seed is this step's argmax. Its prev_hidden is
++        // either the predicted main-model hidden (Option A) or the MTP head's
++        // own output hidden (legacy chained mode).
+         seed = (llama_token) best_idx;
+-        next_prev_hidden = scratch_out_hidden.data();
++        if (predictive_enabled) {
++            // Advance accumulator: predict_hidden += alpha * embed(seed).
++            if (fetch_embed_row(seed, emb_row.data())) {
++                for (size_t j = 0; j < n_embd_mtp; ++j) {
++                    predict_hidden[j] += predictive_alpha * emb_row[j];
++                }
++                next_prev_hidden = predict_hidden.data();
++            } else {
++                // Fallback: if we can't dequantize the row, degrade to the
++                // identity predictor (h_{t+1} = h_t), which means reusing the
++                // current predict_hidden without update.
++                next_prev_hidden = predict_hidden.data();
++            }
++            if (std::getenv("MTP_DEBUG_PREDICT") != nullptr) {
++                double s0 = 0.0, s1 = 0.0;
++                for (size_t j = 0; j < n_embd_mtp; ++j) {
++                    s0 += predict_hidden[j];
++                    s1 += (double) predict_hidden[j] * (double) predict_hidden[j];
++                }
++                fprintf(stderr, "[MTP_PREDICT] k=%d alpha=%.3f seed=%d mean=%.6f rms=%.6f\n",
++                        k, predictive_alpha, (int) seed,
++                        s0 / (double) n_embd_mtp,
++                        std::sqrt(s1 / (double) n_embd_mtp));
++            }
++        } else {
++            next_prev_hidden = scratch_out_hidden.data();
++        }
+     }
+ 
+     return produced;
+-- 
+2.51.2
+

@@ -1,0 +1,319 @@
+From 268e325f0d1333630b1c618e081fc4b7d6fe377b Mon Sep 17 00:00:00 2001
+From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+Date: Wed, 8 Apr 2026 19:39:26 -0400
+Subject: [PATCH] feat(mtp): perturbed-head ensemble via top-K tree-fork verify
+
+Opt-in via MTP_ENSEMBLE_K=N. When set, llama_mtp_draft emits top-N
+sibling candidates for position t+1 from one MTP forward pass instead
+of chaining. mtp-speculative verifies as a tree fork: slot-0 logits
+predict the true next token; whichever draft matches is accepted.
+
+- Top-1 hit (happy path): one forward pass, commits 2 tokens (d_0 +
+  slot-1 lookahead).
+- Alt hit / miss: snapshot-rollback + T=2 re-decode to commit the
+  correct branch, 2 forward passes for 2 tokens.
+
+K=1 default path is untouched.
+---
+ examples/mtp-speculative/mtp-speculative.cpp | 179 ++++++++++++++++++-
+ src/llama-context.cpp                        |  63 +++++++
+ 2 files changed, 240 insertions(+), 2 deletions(-)
+
+diff --git a/examples/mtp-speculative/mtp-speculative.cpp b/examples/mtp-speculative/mtp-speculative.cpp
+index 4f4b072ff..006792f2e 100644
+--- a/examples/mtp-speculative/mtp-speculative.cpp
++++ b/examples/mtp-speculative/mtp-speculative.cpp
+@@ -131,11 +131,34 @@ int main(int argc, char ** argv) {
+ 
+     LOG("%s", common_token_to_piece(ctx_tgt, id_last).c_str());
+ 
+-    // Allocate a reusable batch large enough for 1 + K verification tokens.
+-    llama_batch verify_batch = llama_batch_init(1 + n_draft_max, 0, 1);
++    // Branching speculative tree config (opt-in).
++    // MTP_TREE_B     branching factor at each tree level (default 0 = disabled)
++    // MTP_TREE_DEPTH tree depth (default 1)
++    // When enabled, at each draft step we take the top-B MTP candidates at
++    // depth 0 and greedily chain each to depth D-1, then verify all B chains
++    // in a single batched forward pass using one llama sequence per branch.
++    // Shared prefix id_last is assigned all B sequence ids; the B*D leaves
++    // each live in their own single sequence. After verify we pick the longest
++    // accepted prefix, snapshot-restore recurrent state, and re-decode the
++    // committed prefix autoregressively so recurrent numerics stay clean.
++    const int32_t tree_B = (getenv("MTP_TREE_B")     != nullptr) ? atoi(getenv("MTP_TREE_B"))     : 0;
++    const int32_t tree_D = (getenv("MTP_TREE_DEPTH") != nullptr) ? atoi(getenv("MTP_TREE_DEPTH")) : 1;
++    const bool    tree_on = (tree_B >= 2 && tree_D >= 1);
++
++    // Batch sizing: non-tree path needs 1 + n_draft_max slots, single seq each.
++    // Tree path needs 1 + B*D slots and up to B seq_ids per token (id_last is
++    // shared across all B branches so needs n_seq_id capacity = B).
++    const int32_t verify_max_tokens = tree_on ? (1 + tree_B * tree_D) : (1 + n_draft_max);
++    const int32_t verify_max_seq    = tree_on ? tree_B                : 1;
++    llama_batch verify_batch = llama_batch_init(verify_max_tokens, 0, verify_max_seq);
+ 
+     const llama_token eos_tok = llama_vocab_eos(vocab_tgt);
+ 
++    // Tree branch stats.
++    size_t tree_iters    = 0;
++    size_t tree_acc_tok  = 0;
++    size_t tree_hit_iter = 0; // iters with >= 1 accepted branch token
++
+     // Hidden-state drift correction (strategy A: periodic T=1 refresh).
+     // Env var MTP_REFRESH_EVERY=N (default 0 = disabled). When >0, every N
+     // committed tokens we skip the MTP draft path and do a plain T=1 decode
+@@ -147,6 +170,23 @@ int main(int argc, char ** argv) {
+     int32_t tokens_since_refresh = 0;
+     int32_t n_refreshes = 0;
+ 
++    // --- Ensemble mode (opt-in via MTP_ENSEMBLE_K) ---
++    // When set, the MTP draft call returns top-K sibling candidates for
++    // position n_past+1 (tree-fork, not a chain). Verify batch is
++    // [id_last, d_0, ..., d_{K-1}]. Slot 0's logits are the target's
++    // true prediction for position n_past+1. Whichever draft matches
++    // slot-0-argmax is the accepted one; if it's d_0 the cache is already
++    // correct, otherwise we roll back and re-decode the right branch.
++    const char *  env_ens     = getenv("MTP_ENSEMBLE_K");
++    const int32_t ensemble_k  = env_ens ? std::max(0, std::min(n_draft_max, atoi(env_ens))) : 0;
++    const bool    ensemble_on = ensemble_k > 0;
++    int32_t n_ens_hit_d0      = 0;
++    int32_t n_ens_hit_alt     = 0;
++    int32_t n_ens_miss        = 0;
++    if (ensemble_on) {
++        LOG_INF("%s: ENSEMBLE mode active, k=%d (tree-fork verify)\n", __func__, ensemble_k);
++    }
++
+     const int64_t t_dec_start = ggml_time_us();
+ 
+     while ((int) generated.size() < n_predict) {
+@@ -234,6 +274,132 @@ int main(int argc, char ** argv) {
+ 
+         const int32_t n_drafted = (int32_t) drafts.size();
+ 
++        // === ENSEMBLE TREE-FORK VERIFY PATH ===
++        // When MTP_ENSEMBLE_K is set, drafts[0..K-1] are sibling alternatives
++        // for position n_past+1 (not a chain). Decode [id_last, d_0, ..., d_{K-1}]
++        // as a single batch. Slot-0's logits = target's true prediction for
++        // position n_past+1. Accepted draft = whichever d_i matches. If d_0,
++        // cache is already correct AND slot-1 logits give a free lookahead
++        // for position n_past+2. Else rollback + re-decode [id_last, d_i].
++        if (ensemble_on) {
++            verify_batch.n_tokens     = 1 + n_drafted;
++            verify_batch.token[0]     = id_last;
++            verify_batch.pos[0]       = n_past;
++            verify_batch.n_seq_id[0]  = 1;
++            verify_batch.seq_id[0][0] = 0;
++            verify_batch.logits[0]    = 1;
++            for (int32_t i = 0; i < n_drafted; ++i) {
++                verify_batch.token[1 + i]     = drafts[i];
++                verify_batch.pos[1 + i]       = n_past + 1 + i;
++                verify_batch.n_seq_id[1 + i]  = 1;
++                verify_batch.seq_id[1 + i][0] = 0;
++                verify_batch.logits[1 + i]    = 1;
++            }
++
++            llama_memory_recurrent_snapshot_t snap_e = nullptr;
++            if (llama_memory_snapshot_recurrent(ctx_tgt, &snap_e) != 0) {
++                snap_e = nullptr;
++            }
++
++            if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                LOG_ERR("%s: ensemble verify decode failed\n", __func__);
++                llama_memory_release_snapshot(snap_e);
++                break;
++            }
++            common_speculative_mtp_note_forward_pass(spec);
++
++            // Slot 0 argmax = target's true prediction for position n_past+1.
++            const llama_token target_next = argmax_logits(llama_get_logits_ith(ctx_tgt, 0));
++
++            int32_t match_idx = -1;
++            for (int32_t i = 0; i < n_drafted; ++i) {
++                if (drafts[i] == target_next) { match_idx = i; break; }
++            }
++
++            if (match_idx == 0) {
++                // Top-1 matched. Cache at n_past+1 is already d_0 (correct).
++                // slot-1 logits predict position n_past+2 conditioned on d_0.
++                common_speculative_mtp_accept(spec, n_drafted, 1);
++                generated.push_back(drafts[0]);
++                LOG("%s", common_token_to_piece(ctx_tgt, drafts[0]).c_str());
++                common_speculative_mtp_note_committed(spec, 1);
++
++                const llama_token nt = argmax_logits(llama_get_logits_ith(ctx_tgt, 1));
++                generated.push_back(nt);
++                LOG("%s", common_token_to_piece(ctx_tgt, nt).c_str());
++                common_speculative_mtp_note_committed(spec, 1);
++
++                n_past += 2;
++                id_last = nt;
++                tokens_since_refresh += 2;
++                n_ens_hit_d0++;
++
++                // Trim junk draft positions n_past..n_past+K-2 from attention.
++                if (snap_e != nullptr) {
++                    llama_memory_seq_rm_attn_only(ctx_tgt, 0, n_past, -1);
++                    llama_memory_release_snapshot(snap_e);
++                    snap_e = nullptr;
++                } else {
++                    llama_memory_seq_rm(mem_tgt, 0, n_past, -1);
++                }
++
++                if (id_last == eos_tok) break;
++                continue;
++            }
++
++            // Miss or alt-match: rollback and commit via a T=2 re-decode.
++            const llama_token commit_next =
++                (match_idx >= 0) ? drafts[match_idx] : target_next;
++
++            if (snap_e != nullptr) {
++                llama_memory_restore_recurrent(ctx_tgt, snap_e);
++                llama_memory_seq_rm_attn_only(ctx_tgt, 0, n_past, -1);
++                llama_memory_release_snapshot(snap_e);
++                snap_e = nullptr;
++            } else {
++                llama_memory_seq_rm(mem_tgt, 0, n_past, -1);
++            }
++
++            verify_batch.n_tokens     = 2;
++            verify_batch.token[0]     = id_last;
++            verify_batch.pos[0]       = n_past;
++            verify_batch.n_seq_id[0]  = 1;
++            verify_batch.seq_id[0][0] = 0;
++            verify_batch.logits[0]    = 0;
++            verify_batch.token[1]     = commit_next;
++            verify_batch.pos[1]       = n_past + 1;
++            verify_batch.n_seq_id[1]  = 1;
++            verify_batch.seq_id[1][0] = 0;
++            verify_batch.logits[1]    = 1;
++
++            if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                LOG_ERR("%s: ensemble commit decode failed\n", __func__);
++                break;
++            }
++            common_speculative_mtp_note_forward_pass(spec);
++
++            const llama_token nt_after = argmax_logits(llama_get_logits_ith(ctx_tgt, 1));
++
++            common_speculative_mtp_accept(spec, n_drafted, match_idx >= 0 ? 1 : 0);
++            generated.push_back(commit_next);
++            LOG("%s", common_token_to_piece(ctx_tgt, commit_next).c_str());
++            common_speculative_mtp_note_committed(spec, 1);
++
++            generated.push_back(nt_after);
++            LOG("%s", common_token_to_piece(ctx_tgt, nt_after).c_str());
++            common_speculative_mtp_note_committed(spec, 1);
++
++            n_past += 2;
++            id_last = nt_after;
++            tokens_since_refresh += 2;
++
++            if (match_idx >= 0) n_ens_hit_alt++;
++            else                n_ens_miss++;
++
++            if (id_last == eos_tok) break;
++            continue;
++        }
++
+         // Step 2: build verification batch = [id_last, draft_0, .., draft_{K-1}]
+         verify_batch.n_tokens = 1 + n_drafted;
+         verify_batch.token[0]     = id_last;
+@@ -448,6 +614,15 @@ int main(int argc, char ** argv) {
+     if (mtp_refresh_every > 0) {
+         LOG("mtp_refresh: every=%d n_refreshes=%d\n", mtp_refresh_every, n_refreshes);
+     }
++    if (ensemble_on) {
++        const int32_t n_ens_cycles = n_ens_hit_d0 + n_ens_hit_alt + n_ens_miss;
++        const double p_d0  = n_ens_cycles ? 100.0 * n_ens_hit_d0  / n_ens_cycles : 0.0;
++        const double p_alt = n_ens_cycles ? 100.0 * n_ens_hit_alt / n_ens_cycles : 0.0;
++        const double p_mis = n_ens_cycles ? 100.0 * n_ens_miss    / n_ens_cycles : 0.0;
++        LOG_INF("ensemble: k=%d cycles=%d hit_d0=%d (%.0f%%) hit_alt=%d (%.0f%%) miss=%d (%.0f%%)\n",
++                ensemble_k, n_ens_cycles,
++                n_ens_hit_d0, p_d0, n_ens_hit_alt, p_alt, n_ens_miss, p_mis);
++    }
+ 
+     llama_batch_free(verify_batch);
+     common_speculative_mtp_free(spec);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 41cf9ccce..1223c0570 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3855,6 +3855,23 @@ int32_t llama_mtp_draft(
+         }
+     }
+ 
++    // Ensemble mode (experimental, opt-in): MTP_ENSEMBLE_K=N > 0 disables the
++    // chain entirely and instead produces N drafts from a SINGLE MTP forward
++    // pass by taking the top-N tokens of the logits row. The drafts are
++    // sibling alternatives for position n_past+1 — the caller is expected to
++    // verify them as a tree-fork, accepting whichever matches the target's
++    // true argmax at position n_past+1.
++    //
++    // Rationale: the perturbed-head ensemble idea from the task brief assumes
++    // multiple MTP heads; we only have one, so we emulate the decorrelation
++    // by sampling top-K from a single forward pass (option D in the brief).
++    int32_t ensemble_k = 0;
++    if (const char * s = std::getenv("MTP_ENSEMBLE_K")) {
++        ensemble_k = (int32_t) std::atoi(s);
++        if (ensemble_k > n_draft) ensemble_k = n_draft;
++        if (ensemble_k < 0)       ensemble_k = 0;
++    }
++
+     // Predictive hidden state (Option A): for k>=1, approximate what the main
+     // model's hidden would be at position t+k as
+     //   h_{t+k} ~= h_main + alpha * sum_{j<k} embed(draft_token_j)
+@@ -3925,6 +3942,52 @@ int32_t llama_mtp_draft(
+         return true;
+     };
+ 
++    // --- Ensemble branch (opt-in via MTP_ENSEMBLE_K) ---
++    // Single MTP forward pass, return top-K tokens as sibling draft candidates.
++    // No chaining; caller handles tree verification.
++    if (ensemble_k > 0) {
++        const int32_t rc = ctx->mtp_graph_compute(
++                last_token,
++                /*prev_hidden_override=*/nullptr,
++                scratch_logits.data(),
++                n_vocab,
++                scratch_out_hidden.data());
++        if (rc != 0) {
++            return rc;
++        }
++
++        // Partial top-K selection by iterating: keep a running sorted-desc
++        // list of the top ensemble_k indices. n_vocab can be large (~250K),
++        // so full std::sort would be wasteful; this is O(n_vocab * ensemble_k)
++        // which is fine for small K.
++        std::vector<int64_t> top_idx(ensemble_k, -1);
++        std::vector<float>   top_val(ensemble_k, -std::numeric_limits<float>::infinity());
++        for (int64_t v = 0; v < n_vocab; ++v) {
++            const float val = scratch_logits[v];
++            // Insert into sorted-desc list if bigger than the smallest top entry.
++            if (val > top_val[ensemble_k - 1]) {
++                int32_t j = ensemble_k - 1;
++                while (j > 0 && top_val[j - 1] < val) {
++                    top_val[j] = top_val[j - 1];
++                    top_idx[j] = top_idx[j - 1];
++                    --j;
++                }
++                top_val[j] = val;
++                top_idx[j] = v;
++            }
++        }
++
++        for (int32_t i = 0; i < ensemble_k; ++i) {
++            out_tokens[i] = (llama_token) (top_idx[i] >= 0 ? top_idx[i] : 0);
++            if (out_logits != nullptr) {
++                std::memcpy(out_logits + (size_t) i * (size_t) n_vocab,
++                            scratch_logits.data(),
++                            (size_t) n_vocab * sizeof(float));
++            }
++        }
++        return ensemble_k;
++    }
++
+     llama_token seed = last_token;
+     // First step uses the cached main-decode hidden (prev_hidden_override = nullptr
+     // → mtp_graph_compute falls back to ctx->mtp_prev_hidden). Subsequent steps
+-- 
+2.51.2
+

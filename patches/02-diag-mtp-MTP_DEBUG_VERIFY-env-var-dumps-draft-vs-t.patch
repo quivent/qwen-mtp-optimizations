@@ -1,0 +1,44 @@
+From 0eb4d026c80b9c6c5a3816a8ae235f3d37dbb2f6 Mon Sep 17 00:00:00 2001
+From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+Date: Wed, 8 Apr 2026 18:58:58 -0400
+Subject: [PATCH] diag(mtp): MTP_DEBUG_VERIFY env var dumps draft vs target
+ argmax per step
+
+---
+ examples/mtp-speculative/mtp-speculative.cpp | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/examples/mtp-speculative/mtp-speculative.cpp b/examples/mtp-speculative/mtp-speculative.cpp
+index 15a6ebe9f..286068e49 100644
+--- a/examples/mtp-speculative/mtp-speculative.cpp
++++ b/examples/mtp-speculative/mtp-speculative.cpp
+@@ -216,6 +216,26 @@ int main(int argc, char ** argv) {
+         const int32_t n_accepted = common_speculative_mtp_verify_greedy(
+                 spec, drafts, verify_logits_for_pos, &vctx, n_vocab);
+ 
++        // DEBUG: for every draft step, dump draft_id and target_argmax_id side
++        // by side. Purpose: confirm whether the accept comparator is declaring
++        // mismatches when the tokens actually match (vocab duplicates,
++        // off-by-one in logits_ith, or bug).
++        if (getenv("MTP_DEBUG_VERIFY") != nullptr) {
++            for (int32_t dbg_i = 0; dbg_i < n_drafted; ++dbg_i) {
++                const float * dbg_logits = llama_get_logits_ith(ctx_tgt, dbg_i);
++                if (dbg_logits == nullptr) break;
++                llama_token dbg_argmax = argmax_logits(dbg_logits);
++                const std::string draft_piece  = common_token_to_piece(ctx_tgt, drafts[dbg_i]);
++                const std::string target_piece = common_token_to_piece(ctx_tgt, dbg_argmax);
++                fprintf(stderr,
++                        "[MTP_DEBUG] step=%d draft_id=%d target_argmax_id=%d equal=%d "
++                        "draft_piece=|%s| target_piece=|%s|\n",
++                        dbg_i, (int) drafts[dbg_i], (int) dbg_argmax,
++                        (drafts[dbg_i] == dbg_argmax) ? 1 : 0,
++                        draft_piece.c_str(), target_piece.c_str());
++            }
++        }
++
+         common_speculative_mtp_accept(spec, n_drafted, n_accepted);
+ 
+         // Step 5: commit accepted draft tokens.
+-- 
+2.51.2
+
