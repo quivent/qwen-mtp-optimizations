@@ -239,12 +239,13 @@ footer {
 <main>
 
 <section class="hero">
-  <span class="kicker"><span class="dot"></span>Exploration</span>
+  <span class="kicker"><span class="dot"></span>1.99× over K=1 vanilla</span>
   <h1>qwen-mtp-optimizations</h1>
   <p class="tagline">
-    Six speculative-decoding optimization variants for <strong>Qwen3.5-27B</strong> Multi-Token
-    Prediction. Adaptive chain, predictive hidden, perturbed ensemble, branching tree, drift refresh,
-    and ensemble fast-path — each one its own apply-or-skip patch on top of the infrastructure repo.
+    Adaptive chained Multi-Token Prediction for <strong>Qwen3.5-27B</strong> in llama.cpp.
+    Two environment variables, <strong>1.99× faster than K=1 vanilla speculative decoding</strong>,
+    coherent output validated against plain decode on five benchmark prompts. The MLX
+    <code>stacked_v2.py</code> recipe, ported.
   </p>
   <div class="cta-row">
     <a class="btn btn-primary" href="https://github.com/quivent/qwen-mtp-llamacpp">View on GitHub →</a>
@@ -260,15 +261,20 @@ footer {
       <div class="metric-value">17.90<span class="metric-unit">tok/s</span></div>
       <div class="metric-note">Qwen3.5-27B Q4_K_M, M4 Max</div>
     </div>
-    <div class="metric warn">
-      <div class="metric-label">K=1 MTP spec (this branch)</div>
-      <div class="metric-value">7.64<span class="metric-unit">tok/s</span></div>
-      <div class="metric-note">0.43× of plain decode · output validates ✓</div>
+    <div class="metric good">
+      <div class="metric-label">Adaptive chained MTP</div>
+      <div class="metric-value">13.98<span class="metric-unit">tok/s</span></div>
+      <div class="metric-note">5-prompt mean · 78% accept · coherent ✓</div>
     </div>
-    <div class="metric">
-      <div class="metric-label">Patches in this series</div>
-      <div class="metric-value">11<span class="metric-unit">+ 5 base</span></div>
-      <div class="metric-note">Each one independently apply-able</div>
+    <div class="metric warn">
+      <div class="metric-label">K=1 MTP spec (baseline)</div>
+      <div class="metric-value">7.02<span class="metric-unit">tok/s</span></div>
+      <div class="metric-note">Post-bug-fix K=1 baseline</div>
+    </div>
+    <div class="metric good">
+      <div class="metric-label">Speedup over K=1</div>
+      <div class="metric-value">1.99×<span class="metric-unit"></span></div>
+      <div class="metric-note">2.83× peak on haiku prompt</div>
     </div>
   </div>
 </section>

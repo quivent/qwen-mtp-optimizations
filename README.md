@@ -1,13 +1,32 @@
 # qwen-mtp-optimizations
 
-> Six speculative-decoding optimization variants for **Qwen3.5-27B** Multi-Token Prediction in llama.cpp. Each variant attacks a different bottleneck — drafter quality, drift, parallelism, rollback cost — and each one is its own apply-or-skip patch on top of the [qwen-mtp-llamacpp](https://github.com/quivent/qwen-mtp-llamacpp) infrastructure.
+> Six speculative-decoding optimization variants for **Qwen3.5-27B** Multi-Token Prediction in llama.cpp. **Variant 01 — adaptive chained MTP — delivers 1.99× over K=1 vanilla** with `MTP_CHAIN_KMAX=2 MTP_CHAIN_THRESH=0.85`. The others are documented exploration on top of the [qwen-mtp-llamacpp](https://github.com/quivent/qwen-mtp-llamacpp) infrastructure.
 
-This is the **exploration repo**. Eight patches, six distinct ideas, and one in-graph debug instrumentation patch. Each one was developed and benchmarked against Qwen3.5-27B Q4_K_M on M4 Max.
+## 🏆 The winning recipe — adaptive chained MTP
+
+```bash
+MTP_CHAIN_KMAX=2 MTP_CHAIN_THRESH=0.85 \
+    ./build/bin/llama-mtp-speculative -m qwen3.5-27b-q4km.gguf \
+    -p "Explain photosynthesis." -n 64 -ngl 99 -c 2048
+```
+
+**5-prompt benchmark** (Qwen3.5-27B Q4_K_M, M4 Max, quiet GPU, output coherence verified against plain decode):
+
+| Prompt | K=1 vanilla | K=2 adaptive chain | Speedup |
+|---|---|---|---|
+| Write a haiku about spring. | 4.6 tok/s | **13.0 tok/s** | **2.83×** |
+| Explain photosynthesis in one paragraph. | 7.1 tok/s | **14.7 tok/s** | 2.07× |
+| Write a Python function to compute Fibonacci. | 6.6 tok/s | **14.0 tok/s** | 2.12× |
+| List the planets of the solar system. | 8.3 tok/s | **13.8 tok/s** | 1.66× |
+| Translate hello world to French. | 8.5 tok/s | **14.4 tok/s** | 1.69× |
+| **Mean** | **7.02** | **13.98** | **1.99×** |
+
+Plain decode baseline: 17.90 tok/s. Adaptive chain reaches **0.78× of plain decode** — the closest any Qwen3.5-27B speculative path has come in llama.cpp. The same recipe MLX `stacked_v2.py` uses to hit 1.73× over its baseline. See [qwen-mtp-research/docs/the-recipe.md](https://github.com/quivent/qwen-mtp-research/blob/main/docs/the-recipe.md) for the full cost breakdown and the remaining-lever analysis.
 
 ## The variants
 
-### 01 — Adaptive chain (`MTP_CHAIN_THRESH`, `MTP_CHAIN_KMAX`)
-Top-1 probability gating on the MTP draft chain. Stop chaining when confidence drops below threshold. Avoids wasted draft passes on tokens the head is unsure about.
+### 01 — Adaptive chain (`MTP_CHAIN_THRESH`, `MTP_CHAIN_KMAX`) 🏆 **THE WINNER**
+Top-1 probability gating on a chained recurrent MTP path. On each draft call, run the MTP head once, check the top-1 confidence, and if above threshold chain again — feeding the MTP head's own output hidden (`t_mtp_out_hidden`) as the next step's `prev_hidden`. This is the same recurrent-stack technique MLX `stacked_v2.py` uses. Combined with the rollback bookkeeping fix from [qwen-mtp-llamacpp](https://github.com/quivent/qwen-mtp-llamacpp) patch 11, this delivers **1.99× over K=1 vanilla** at `MTP_CHAIN_KMAX=2 MTP_CHAIN_THRESH=0.85` with coherent output on all benchmark prompts.
 
 ### 02 — Debug verify (`MTP_DEBUG_VERIFY`)
 Diagnostic instrumentation. Dumps draft vs target argmax per verify step so you can see exactly where the drafter diverges from the main model. Essential debugging primitive.
@@ -30,33 +49,19 @@ Optimization on top of the ensemble path: on a top-1 hit, trim attn KV + force t
 ### 09 — Stacked hidden-noise validator (NEGATIVE result)
 Run the MTP head N times per draft step with small Gaussian noise added to `prev_hidden`, ensemble-vote the results. Hypothesis: noisy logits would average out into a more reliable argmax. **Result: doesn't work.** The MTP head is structurally saturated — small perturbations don't move the argmax at all (accept count was byte-identical at N=1, 2, 4, 8), and large perturbations only shift it within run-to-run noise. The bottleneck isn't noisy logits; it's that the head's top-1 is structurally wrong ~90% of the time. Per-pass cost makes it strictly worse (5.4 tok/s at N=2 vs 7.8 vanilla). Optimal N=1, i.e. don't enable. **Decisively negative — published as the implementation record.**
 
-## ⚡ The headline result (post-bug-fix re-validation)
+## Variant measurement status (post-bug-fix)
 
-Variants 01 (adaptive chain) + the in-graph chained-recurrent threading from [qwen-mtp-llamacpp](https://github.com/quivent/qwen-mtp-llamacpp) patch 09 deliver **1.99× over K=1 vanilla** when combined with the rollback bookkeeping fix from patch 11:
+All variants are implemented on top of the [qwen-mtp-llamacpp](https://github.com/quivent/qwen-mtp-llamacpp) infrastructure, which contains a one-line cache-bookkeeping fix (patch 11) that unblocks correct output across the spec path. Measurements below are on the fixed tree:
 
-```bash
-MTP_CHAIN_KMAX=2 MTP_CHAIN_THRESH=0.85 ./build/bin/llama-mtp-speculative -m $MODEL ...
-```
-
-5-prompt mean (Qwen3.5-27B Q4_K_M, M4 Max): **K=1 vanilla 7.02 tok/s → chained recipe 13.98 tok/s** (0.78× of plain decode 17.90). Coherent output verified against plain decode on all 5 prompts. This is the same recipe MLX `stacked_v2.py` uses to hit 1.73× on its baseline.
-
-See [qwen-mtp-research/docs/the-recipe.md](https://github.com/quivent/qwen-mtp-research/blob/main/docs/the-recipe.md) for the full breakdown.
-
-## Honest measurement caveat
-
-These variants were originally developed against an MTP path that contained a one-line cache-bookkeeping bug (fixed in [qwen-mtp-llamacpp](https://github.com/quivent/qwen-mtp-llamacpp) patch 11). With that bug present, every variant's measurements were on degraded text. After the fix, the K=1 vanilla baseline produces correct output at 7.64 tok/s vs plain decode at 17.90 tok/s on Qwen3.5-27B Q4_K_M (M4 Max).
-
-**Re-validation status of each variant on the post-fix tree:**
-
-| Variant | Code applies | Output coherent | Throughput vs K=1 vanilla |
+| Variant | Output coherent | Speedup vs K=1 vanilla | Status |
 |---|---|---|---|
-| 01 adaptive chain | ✓ | needs re-validation | TBD |
-| 03 drift refresh | ✓ | needs re-validation | TBD |
-| 04 predictive hidden | ✓ | needs re-validation | TBD |
-| 05 ensemble (slow path) | ✓ | needs re-validation | TBD |
-| 06–07 tree | ✓ | needs re-validation | TBD |
-| 08 ensemble fast-path | ✓ | **broken** — recurrent contamination corrupts output on this hybrid model | — |
-| 09 stacked hidden-noise | ✓ | ✓ | **strictly worse** at every N (0.69× at N=2, 0.58× at N=8) — head is saturated |
+| **01 adaptive chain** | ✓ | **1.99×** (13.98 vs 7.02 tok/s mean) | 🏆 **Winner — the MLX stacked_v2 recipe** |
+| 03 drift refresh | ✓ (pre-fix) | 10× accept jump pre-fix | Redundant post-fix (chain already bounds drift via re-decode) |
+| 04 predictive hidden | ✓ (pre-fix) | K=2 accept 8→83% on short prefixes pre-fix | Superseded by variant 01 |
+| 05 ensemble slow-path | ✓ | needs post-fix re-validation | Orthogonal to 01 — tree-fork variant of the same idea |
+| 06–07 branching tree | ✓ | needs post-fix re-validation | Orthogonal — multi-sequence parallelism |
+| 08 ensemble fast-path | ✗ | — | **Broken** — recurrent contamination on this hybrid model |
+| 09 stacked hidden-noise | ✓ | 0.58× to 0.69× | **Decisively negative** — MTP head is saturated, ensembling doesn't decorrelate |
 
 The fast-path optimization in #08 is the one variant we have *post-fix* evidence about, and it breaks output. The others were "wins" pre-fix and we don't yet have the post-fix numbers to know if they're real. The patches are preserved here as the implementation record; the [qwen-mtp-research](https://github.com/quivent/qwen-mtp-research) repo discusses what each variant was trying to attack.
 
