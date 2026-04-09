@@ -27,6 +27,9 @@ Full B*D tree with multi-sequence batching. Each branch root is independently ch
 ### 08 — Ensemble fast-path skip
 Optimization on top of the ensemble path: on a top-1 hit, trim attn KV + force the recurrent position metadata backward instead of doing a full snapshot/re-decode. Skips the second forward pass on ~55% of cycles. Requires the `llama_memory_seq_force_recurrent_pos` primitive added in this branch.
 
+### 09 — Stacked hidden-noise validator (NEGATIVE result)
+Run the MTP head N times per draft step with small Gaussian noise added to `prev_hidden`, ensemble-vote the results. Hypothesis: noisy logits would average out into a more reliable argmax. **Result: doesn't work.** The MTP head is structurally saturated — small perturbations don't move the argmax at all (accept count was byte-identical at N=1, 2, 4, 8), and large perturbations only shift it within run-to-run noise. The bottleneck isn't noisy logits; it's that the head's top-1 is structurally wrong ~90% of the time. Per-pass cost makes it strictly worse (5.4 tok/s at N=2 vs 7.8 vanilla). Optimal N=1, i.e. don't enable. **Decisively negative — published as the implementation record.**
+
 ## Honest measurement caveat
 
 These variants were originally developed against an MTP path that contained a one-line cache-bookkeeping bug (fixed in [qwen-mtp-llamacpp](https://github.com/quivent/qwen-mtp-llamacpp) patch 11). With that bug present, every variant's measurements were on degraded text. After the fix, the K=1 vanilla baseline produces correct output at 7.64 tok/s vs plain decode at 17.90 tok/s on Qwen3.5-27B Q4_K_M (M4 Max).
@@ -41,6 +44,7 @@ These variants were originally developed against an MTP path that contained a on
 | 05 ensemble (slow path) | ✓ | needs re-validation | TBD |
 | 06–07 tree | ✓ | needs re-validation | TBD |
 | 08 ensemble fast-path | ✓ | **broken** — recurrent contamination corrupts output on this hybrid model | — |
+| 09 stacked hidden-noise | ✓ | ✓ | **strictly worse** at every N (0.69× at N=2, 0.58× at N=8) — head is saturated |
 
 The fast-path optimization in #08 is the one variant we have *post-fix* evidence about, and it breaks output. The others were "wins" pre-fix and we don't yet have the post-fix numbers to know if they're real. The patches are preserved here as the implementation record; the [qwen-mtp-research](https://github.com/quivent/qwen-mtp-research) repo discusses what each variant was trying to attack.
 

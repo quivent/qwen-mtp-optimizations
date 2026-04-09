@@ -1,0 +1,131 @@
+From 6f85e88170db11ba0727d60161ff28e2f34a2b22 Mon Sep 17 00:00:00 2001
+From: claudebuildsapps <claude.jbenjaminkr@gmail.com>
+Date: Wed, 8 Apr 2026 21:47:39 -0400
+Subject: [PATCH] feat(mtp): stacked hidden-noise ensemble (MTP_STACK_N)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds N repeated MTP head forward passes per draft step with Gaussian
+noise added to prev_hidden, summing logits before argmax. Gated by
+MTP_STACK_N (default 1 = byte-identical vanilla) and MTP_STACK_NOISE
+(sigma, default 1e-3). Exploratory — measurement shows the head's
+argmax is insensitive to input perturbation on Qwen3.5-27B hybrid,
+so stacking adds cost without raising accept rate.
+---
+ src/llama-context.cpp | 84 +++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 78 insertions(+), 6 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5a5eb69c9..f75ab99b4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -17,6 +17,7 @@
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
++#include <random>
+ #include <stdexcept>
+ #include <vector>
+ 
+@@ -3921,6 +3922,21 @@ int32_t llama_mtp_draft(
+         predictive_enabled = true;
+     }
+ 
++    // Stacked ensemble over the single MTP head: run N forward passes with
++    // small Gaussian noise added to prev_hidden, sum logits across passes,
++    // then argmax. Default N=1 → byte-identical to the vanilla path.
++    //   MTP_STACK_N     — number of stacked passes per draft step (default 1)
++    //   MTP_STACK_NOISE — sigma of added Gaussian noise (default 1e-3)
++    int32_t stack_n     = 1;
++    float   stack_noise = 1e-3f;
++    if (const char * s = std::getenv("MTP_STACK_N")) {
++        const int32_t v = (int32_t) std::atoi(s);
++        if (v > 1) stack_n = v;
++    }
++    if (const char * s = std::getenv("MTP_STACK_NOISE")) {
++        stack_noise = (float) std::atof(s);
++    }
++
+     // Scratch buffer for one row of logits per draft step.
+     std::vector<float> scratch_logits((size_t) n_vocab);
+ 
+@@ -4031,13 +4047,69 @@ int32_t llama_mtp_draft(
+     const float * next_prev_hidden = nullptr;
+     int32_t produced = 0;
+ 
++    // Stacked-ensemble scratch (only allocated when stack_n > 1).
++    std::vector<float> stack_accum_logits;
++    std::vector<float> stack_base_hidden;
++    std::vector<float> stack_noised_hidden;
++    std::mt19937       stack_rng(0xC0FFEEu ^ (uint32_t) last_token);
++    std::normal_distribution<float> stack_dist(0.0f, stack_noise);
++    if (stack_n > 1) {
++        stack_accum_logits.resize((size_t) n_vocab);
++        stack_base_hidden.resize(n_embd_mtp);
++        stack_noised_hidden.resize(n_embd_mtp);
++    }
++
+     for (int32_t k = 0; k < chain_kmax; ++k) {
+-        const int32_t rc = ctx->mtp_graph_compute(
+-                seed,
+-                next_prev_hidden,
+-                scratch_logits.data(),
+-                n_vocab,
+-                scratch_out_hidden.data());
++        int32_t rc = 0;
++        if (stack_n > 1) {
++            // Build the base hidden for this step: either the chained/predicted
++            // buffer, or the context's cached main-decode hidden if unset.
++            const float * base_h = next_prev_hidden;
++            if (base_h == nullptr) {
++                base_h = ctx->get_mtp_prev_hidden();
++            }
++            if (base_h == nullptr) {
++                // Fall back to vanilla single pass; stacking requires a hidden.
++                rc = ctx->mtp_graph_compute(seed, next_prev_hidden,
++                        scratch_logits.data(), n_vocab, scratch_out_hidden.data());
++            } else {
++                std::memcpy(stack_base_hidden.data(), base_h, n_embd_mtp * sizeof(float));
++                std::fill(stack_accum_logits.begin(), stack_accum_logits.end(), 0.0f);
++                for (int32_t s = 0; s < stack_n; ++s) {
++                    // Pass 0 is noise-free so an N=1 equivalent pass is included.
++                    if (s == 0) {
++                        std::memcpy(stack_noised_hidden.data(), stack_base_hidden.data(),
++                                    n_embd_mtp * sizeof(float));
++                    } else {
++                        for (size_t j = 0; j < n_embd_mtp; ++j) {
++                            stack_noised_hidden[j] = stack_base_hidden[j] + stack_dist(stack_rng);
++                        }
++                    }
++                    rc = ctx->mtp_graph_compute(
++                            seed,
++                            stack_noised_hidden.data(),
++                            scratch_logits.data(),
++                            n_vocab,
++                            /*out_hidden=*/ (s == 0) ? scratch_out_hidden.data() : nullptr);
++                    if (rc != 0) break;
++                    for (int64_t v = 0; v < n_vocab; ++v) {
++                        stack_accum_logits[v] += scratch_logits[v];
++                    }
++                }
++                if (rc == 0) {
++                    // Move summed logits into scratch_logits for downstream argmax/softmax.
++                    std::memcpy(scratch_logits.data(), stack_accum_logits.data(),
++                                (size_t) n_vocab * sizeof(float));
++                }
++            }
++        } else {
++            rc = ctx->mtp_graph_compute(
++                    seed,
++                    next_prev_hidden,
++                    scratch_logits.data(),
++                    n_vocab,
++                    scratch_out_hidden.data());
++        }
+         if (rc != 0) {
+             // Bail out — return what we have so far if anything.
+             return produced > 0 ? produced : rc;
+-- 
+2.51.2
+
